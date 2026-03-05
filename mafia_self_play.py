@@ -16,7 +16,13 @@ from llama_cpp import Llama
 
 
 ROLE_MAFIA = "mafia"
+ROLE_SILENCER = "silencer"
+ROLE_DOCTOR = "doctor"
+ROLE_DETECTIVE = "detective"
+ROLE_JESTER = "jester"
 ROLE_VILLAGER = "villager"
+MAFIA_TEAM_ROLES = {ROLE_MAFIA, ROLE_SILENCER}
+
 DEFAULT_PERSONAS = (
     "calm and logical",
     "aggressive accuser",
@@ -27,7 +33,7 @@ DEFAULT_PERSONAS = (
     "deceptive storyteller",
     "quiet observer",
 )
-SCHEMA_VERSION = "2.0"
+SCHEMA_VERSION = "3.0"
 
 
 @dataclass
@@ -45,11 +51,15 @@ class SamplingConfig:
 class GameConfig:
     players: int = 8
     mafia_count: int = 2
+    silencer_count: int = 1
+    doctor_count: int = 1
+    detective_count: int = 1
+    jester_count: int = 1
     max_rounds: int = 8
     talks_per_day: int = 1
     allow_tie_break_random: bool = True
     shuffle_speaking_order: bool = True
-    night_mode: str = "random"
+    night_mode: str = "model"
     persona_pool: Tuple[str, ...] = DEFAULT_PERSONAS
 
 
@@ -90,11 +100,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress_every", type=int, default=25, help="Worker progress print interval.")
     parser.add_argument("--verbose", action="store_true")
 
-    parser.add_argument("--players", type=int, default=8)
-    parser.add_argument("--mafia_count", type=int, default=2)
+    parser.add_argument("--players", type=int, default=9)
+    parser.add_argument("--mafia_count", type=int, default=2, help="Total mafia team size (includes silencer).")
+    parser.add_argument("--silencer_count", type=int, default=1)
+    parser.add_argument("--doctor_count", type=int, default=1)
+    parser.add_argument("--detective_count", type=int, default=1)
+    parser.add_argument("--jester_count", type=int, default=1)
     parser.add_argument("--max_rounds", type=int, default=8)
     parser.add_argument("--talks_per_day", type=int, default=1)
-    parser.add_argument("--night_mode", choices=["random", "model"], default="random")
+    parser.add_argument("--night_mode", choices=["random", "model"], default="model")
     parser.add_argument("--no_tie_break_random", action="store_true")
     parser.add_argument("--no_shuffle_speaking_order", action="store_true")
     parser.add_argument("--persona_file", type=str, default="", help="Optional text file with one persona per line.")
@@ -106,7 +120,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeat_penalty", type=float, default=1.1)
     parser.add_argument("--max_tokens_chat", type=int, default=96)
     parser.add_argument("--max_tokens_vote", type=int, default=24)
-
     return parser.parse_args()
 
 
@@ -168,19 +181,76 @@ def model_generate(llm: Llama, prompt: str, sampling: SamplingConfig, max_tokens
     return out["choices"][0]["text"].strip()
 
 
-def assign_roles(players: List[str], mafia_count: int, rng: random.Random) -> Dict[str, str]:
-    mafia = set(rng.sample(players, mafia_count))
-    return {p: (ROLE_MAFIA if p in mafia else ROLE_VILLAGER) for p in players}
+def assign_roles(game_cfg: GameConfig, rng: random.Random) -> Dict[str, str]:
+    players = [f"P{i}" for i in range(1, game_cfg.players + 1)]
+    roles = {p: ROLE_VILLAGER for p in players}
+    remaining = players[:]
+
+    mafia_team = rng.sample(remaining, game_cfg.mafia_count)
+    for p in mafia_team:
+        roles[p] = ROLE_MAFIA
+    for p in mafia_team:
+        remaining.remove(p)
+
+    silencer_members = rng.sample(mafia_team, game_cfg.silencer_count) if game_cfg.silencer_count > 0 else []
+    for p in silencer_members:
+        roles[p] = ROLE_SILENCER
+
+    def pick_and_assign(count: int, role: str) -> None:
+        if count <= 0:
+            return
+        chosen = rng.sample(remaining, count)
+        for p in chosen:
+            roles[p] = role
+            remaining.remove(p)
+
+    pick_and_assign(game_cfg.doctor_count, ROLE_DOCTOR)
+    pick_and_assign(game_cfg.detective_count, ROLE_DETECTIVE)
+    pick_and_assign(game_cfg.jester_count, ROLE_JESTER)
+    return roles
 
 
 def win_status(alive: List[str], roles: Dict[str, str]) -> str:
-    mafia_alive = sum(1 for p in alive if roles[p] == ROLE_MAFIA)
-    vill_alive = len(alive) - mafia_alive
+    mafia_alive = sum(1 for p in alive if roles[p] in MAFIA_TEAM_ROLES)
+    non_mafia_alive = len(alive) - mafia_alive
     if mafia_alive == 0:
         return "villagers"
-    if mafia_alive >= vill_alive:
+    if mafia_alive >= non_mafia_alive:
         return "mafia"
     return ""
+
+
+def talk_prompt(
+    player: str,
+    role: str,
+    persona: str,
+    day_round: int,
+    talk_round: int,
+    alive: List[str],
+    discussion: List[Dict[str, str]],
+    detective_memory: List[Dict[str, str]],
+) -> str:
+    last_talk = "\n".join(f"{x['speaker']}: {x.get('text', '')}" for x in discussion[-14:] if "speaker" in x)
+    private_tip = ""
+    if role in MAFIA_TEAM_ROLES:
+        private_tip = "You are mafia-aligned. Avoid exposing mafia identities.\n"
+    if role == ROLE_DETECTIVE and detective_memory:
+        memories = ", ".join(f"{m['target']}={m['role']}" for m in detective_memory[-4:])
+        private_tip += f"Private detective notes: {memories}\n"
+    return (
+        "You are in a Mafia game.\n"
+        f"Your id: {player}\n"
+        f"Your hidden role: {role}\n"
+        f"Style: {persona}\n"
+        f"Day round: {day_round}\n"
+        f"Talk pass: {talk_round}\n"
+        f"Alive players: {', '.join(alive)}\n"
+        f"{private_tip}"
+        "Recent discussion:\n"
+        f"{last_talk if last_talk else '(none)'}\n\n"
+        "Speak 1-2 short sentences to influence the vote. Do not reveal hidden role.\n"
+        "[END]"
+    )
 
 
 def vote_prompt(
@@ -211,6 +281,7 @@ def vote_prompt(
 
 def mafia_night_prompt(
     player: str,
+    role: str,
     mafia_team: List[str],
     persona: str,
     night_round: int,
@@ -220,8 +291,9 @@ def mafia_night_prompt(
     last_talk = "\n".join(f"{x['speaker']}: {x.get('text', '')}" for x in transcript[-14:] if "speaker" in x)
     return (
         "You are in Mafia game NIGHT phase.\n"
-        f"You are {player} and your team is: {', '.join(sorted(mafia_team))}\n"
-        "You must keep mafia alive and remove villagers.\n"
+        f"Your id: {player}\n"
+        f"Your role: {role}\n"
+        f"Mafia team alive: {', '.join(sorted(mafia_team))}\n"
         f"Style: {persona}\n"
         f"Night round: {night_round}\n"
         f"Alive players: {', '.join(alive)}\n"
@@ -235,27 +307,79 @@ def mafia_night_prompt(
     )
 
 
-def talk_prompt(
+def silencer_prompt(
     player: str,
-    role: str,
+    mafia_team: List[str],
     persona: str,
-    day_round: int,
-    talk_round: int,
+    night_round: int,
     alive: List[str],
-    discussion: List[Dict[str, str]],
+    transcript: List[Dict[str, str]],
 ) -> str:
-    last_talk = "\n".join(f"{x['speaker']}: {x.get('text', '')}" for x in discussion[-14:] if "speaker" in x)
+    last_talk = "\n".join(f"{x['speaker']}: {x.get('text', '')}" for x in transcript[-14:] if "speaker" in x)
     return (
-        "You are in a Mafia game.\n"
+        "You are Silencer in Mafia game NIGHT phase.\n"
         f"Your id: {player}\n"
-        f"Your hidden role: {role}\n"
+        f"Mafia team alive: {', '.join(sorted(mafia_team))}\n"
         f"Style: {persona}\n"
-        f"Day round: {day_round}\n"
-        f"Talk pass: {talk_round}\n"
+        f"Night round: {night_round}\n"
         f"Alive players: {', '.join(alive)}\n"
         "Recent discussion:\n"
         f"{last_talk if last_talk else '(none)'}\n\n"
-        "Speak 1-2 short sentences to influence the vote. Do not reveal hidden role.\n"
+        "Pick one alive NON-mafia player to silence for next day round.\n"
+        "Output strictly:\n"
+        "VOTE: P<number>\n"
+        "REASON: <short reason>\n"
+        "[END]"
+    )
+
+
+def doctor_prompt(
+    player: str,
+    persona: str,
+    night_round: int,
+    alive: List[str],
+    last_saved: str,
+    transcript: List[Dict[str, str]],
+) -> str:
+    last_talk = "\n".join(f"{x['speaker']}: {x.get('text', '')}" for x in transcript[-14:] if "speaker" in x)
+    restriction = f"You cannot save {last_saved} this night." if last_saved else "No save restriction this night."
+    return (
+        "You are Doctor in Mafia game NIGHT phase.\n"
+        f"Your id: {player}\n"
+        f"Style: {persona}\n"
+        f"Night round: {night_round}\n"
+        f"Alive players: {', '.join(alive)}\n"
+        f"{restriction}\n"
+        "Recent discussion:\n"
+        f"{last_talk if last_talk else '(none)'}\n\n"
+        "Pick one alive player to protect from night death.\n"
+        "Output strictly:\n"
+        "VOTE: P<number>\n"
+        "REASON: <short reason>\n"
+        "[END]"
+    )
+
+
+def detective_prompt(
+    player: str,
+    persona: str,
+    night_round: int,
+    alive: List[str],
+    transcript: List[Dict[str, str]],
+) -> str:
+    last_talk = "\n".join(f"{x['speaker']}: {x.get('text', '')}" for x in transcript[-14:] if "speaker" in x)
+    return (
+        "You are Detective in Mafia game NIGHT phase.\n"
+        f"Your id: {player}\n"
+        f"Style: {persona}\n"
+        f"Night round: {night_round}\n"
+        f"Alive players: {', '.join(alive)}\n"
+        "Recent discussion:\n"
+        f"{last_talk if last_talk else '(none)'}\n\n"
+        "Pick one alive player (not yourself) to investigate.\n"
+        "Output strictly:\n"
+        "VOTE: P<number>\n"
+        "REASON: <short reason>\n"
         "[END]"
     )
 
@@ -283,38 +407,6 @@ def resolve_day_vote(votes: Dict[str, str], rng: random.Random, allow_random_tie
     return rng.choice(tied) if allow_random_tie else sorted(tied)[0]
 
 
-def resolve_night_kill_random(mafia_alive: List[str], alive: List[str], rng: random.Random) -> str:
-    possible = [p for p in alive if p not in mafia_alive]
-    return rng.choice(possible) if possible else ""
-
-
-def resolve_night_kill_model(
-    llm: Llama,
-    mafia_alive: List[str],
-    persona: Dict[str, str],
-    day_round: int,
-    alive: List[str],
-    transcript: List[Dict[str, str]],
-    sampling: SamplingConfig,
-    rng: random.Random,
-) -> str:
-    targets = [p for p in alive if p not in mafia_alive]
-    if not targets:
-        return ""
-    votes: Dict[str, str] = {}
-    for p in mafia_alive:
-        raw = model_generate(
-            llm,
-            mafia_night_prompt(p, mafia_alive, persona[p], day_round, alive, transcript),
-            sampling,
-            sampling.max_tokens_vote,
-        )
-        vote = parse_vote(raw, alive, p, rng, allowed=targets)
-        votes[p] = vote
-        transcript.append({"phase": "night_vote", "round": day_round, "speaker": p, "raw": raw, "vote": vote})
-    return resolve_day_vote(votes, rng, allow_random_tie=True)
-
-
 def run_single_game(
     llm: Llama,
     game_id: int,
@@ -324,11 +416,16 @@ def run_single_game(
 ) -> Dict:
     rng = random.Random(seed)
     players = [f"P{i}" for i in range(1, game_cfg.players + 1)]
-    roles = assign_roles(players, game_cfg.mafia_count, rng)
+    roles = assign_roles(game_cfg, rng)
     persona = {p: rng.choice(game_cfg.persona_pool) for p in players}
     alive = players[:]
-    transcript: List[Dict[str, str]] = []
+    public_transcript: List[Dict[str, str]] = []
+    night_private_events: List[Dict[str, str]] = []
+    detective_memory: Dict[str, List[Dict[str, str]]] = {p: [] for p in players if roles[p] == ROLE_DETECTIVE}
+    doctor_last_saved: Dict[str, str] = {p: "" for p in players if roles[p] == ROLE_DOCTOR}
+    muted_today: set = set()
     winner = ""
+    win_reason = ""
 
     for day_round in range(1, game_cfg.max_rounds + 1):
         discussion: List[Dict[str, str]] = []
@@ -337,7 +434,28 @@ def run_single_game(
             if game_cfg.shuffle_speaking_order:
                 rng.shuffle(speaking_order)
             for p in speaking_order:
-                prompt = talk_prompt(p, roles[p], persona[p], day_round, talk_round, alive, transcript + discussion)
+                if p in muted_today:
+                    discussion.append(
+                        {
+                            "phase": "day_talk",
+                            "round": day_round,
+                            "talk_round": talk_round,
+                            "speaker": p,
+                            "text": "(silenced)",
+                            "silenced": True,
+                        }
+                    )
+                    continue
+                prompt = talk_prompt(
+                    p,
+                    roles[p],
+                    persona[p],
+                    day_round,
+                    talk_round,
+                    alive,
+                    public_transcript + discussion,
+                    detective_memory.get(p, []),
+                )
                 text = model_generate(llm, prompt, sampling, sampling.max_tokens_chat)
                 item = {
                     "phase": "day_talk",
@@ -345,51 +463,172 @@ def run_single_game(
                     "talk_round": talk_round,
                     "speaker": p,
                     "text": text,
+                    "silenced": False,
                 }
                 discussion.append(item)
-                transcript.append(item)
+                public_transcript.append(item)
 
         votes: Dict[str, str] = {}
         for p in alive:
-            prompt = vote_prompt(p, roles[p], persona[p], day_round, alive, transcript)
+            prompt = vote_prompt(p, roles[p], persona[p], day_round, alive, public_transcript)
             raw = model_generate(llm, prompt, sampling, sampling.max_tokens_vote)
             vote = parse_vote(raw, alive, p, rng)
             votes[p] = vote
-            transcript.append({"phase": "day_vote", "round": day_round, "speaker": p, "raw": raw, "vote": vote})
+            public_transcript.append({"phase": "day_vote", "round": day_round, "speaker": p, "raw": raw, "vote": vote})
 
         eliminated = resolve_day_vote(votes, rng, game_cfg.allow_tie_break_random)
         if eliminated and eliminated in alive:
+            eliminated_role = roles[eliminated]
             alive.remove(eliminated)
-            transcript.append({"phase": "day_elimination", "round": day_round, "target": eliminated})
+            public_transcript.append(
+                {
+                    "phase": "day_elimination",
+                    "round": day_round,
+                    "target": eliminated,
+                    "revealed_role": eliminated_role,
+                }
+            )
+            if eliminated_role == ROLE_JESTER:
+                winner = "jester"
+                win_reason = f"{eliminated} (jester) was voted out during day."
+                break
 
         winner = win_status(alive, roles)
         if winner:
+            win_reason = "Standard parity/elimination win condition after day vote."
             break
 
-        mafia_alive = [p for p in alive if roles[p] == ROLE_MAFIA]
-        if game_cfg.night_mode == "model":
-            night_kill = resolve_night_kill_model(
-                llm,
-                mafia_alive,
-                persona,
-                day_round,
-                alive,
-                transcript,
-                sampling,
-                rng,
+        mafia_alive = [p for p in alive if roles[p] in MAFIA_TEAM_ROLES]
+        non_mafia_targets = [p for p in alive if roles[p] not in MAFIA_TEAM_ROLES]
+        silencer_alive = [p for p in alive if roles[p] == ROLE_SILENCER]
+        doctors_alive = [p for p in alive if roles[p] == ROLE_DOCTOR]
+        detectives_alive = [p for p in alive if roles[p] == ROLE_DETECTIVE]
+
+        next_muted = set()
+        for s in silencer_alive:
+            if not non_mafia_targets:
+                continue
+            if game_cfg.night_mode == "model":
+                raw = model_generate(
+                    llm,
+                    silencer_prompt(s, mafia_alive, persona[s], day_round, alive, public_transcript),
+                    sampling,
+                    sampling.max_tokens_vote,
+                )
+                target = parse_vote(raw, alive, s, rng, allowed=non_mafia_targets)
+            else:
+                target = rng.choice(non_mafia_targets)
+                raw = f"VOTE: {target}"
+            next_muted.add(target)
+            night_private_events.append(
+                {"phase": "silence", "round": day_round, "actor": s, "target": target, "raw": raw}
             )
+
+        for d in detectives_alive:
+            allowed = [p for p in alive if p != d]
+            if not allowed:
+                continue
+            if game_cfg.night_mode == "model":
+                raw = model_generate(
+                    llm,
+                    detective_prompt(d, persona[d], day_round, alive, public_transcript),
+                    sampling,
+                    sampling.max_tokens_vote,
+                )
+                target = parse_vote(raw, alive, d, rng, allowed=allowed)
+            else:
+                target = rng.choice(allowed)
+                raw = f"VOTE: {target}"
+            detected_role = roles[target]
+            detective_memory[d].append({"round": day_round, "target": target, "role": detected_role})
+            night_private_events.append(
+                {
+                    "phase": "detective_investigation",
+                    "round": day_round,
+                    "actor": d,
+                    "target": target,
+                    "result_role": detected_role,
+                    "raw": raw,
+                }
+            )
+
+        if non_mafia_targets and mafia_alive:
+            mafia_votes = {}
+            for m in mafia_alive:
+                if game_cfg.night_mode == "model":
+                    raw = model_generate(
+                        llm,
+                        mafia_night_prompt(m, roles[m], mafia_alive, persona[m], day_round, alive, public_transcript),
+                        sampling,
+                        sampling.max_tokens_vote,
+                    )
+                    target = parse_vote(raw, alive, m, rng, allowed=non_mafia_targets)
+                else:
+                    target = rng.choice(non_mafia_targets)
+                    raw = f"VOTE: {target}"
+                mafia_votes[m] = target
+                night_private_events.append(
+                    {"phase": "night_vote", "round": day_round, "speaker": m, "target": target, "raw": raw}
+                )
+            night_kill_target = resolve_day_vote(mafia_votes, rng, allow_random_tie=True)
         else:
-            night_kill = resolve_night_kill_random(mafia_alive, alive, rng)
-        if night_kill and night_kill in alive:
-            alive.remove(night_kill)
-            transcript.append({"phase": "night_kill", "round": day_round, "target": night_kill})
+            night_kill_target = ""
+
+        doctor_saved = ""
+        for d in doctors_alive:
+            allowed = alive[:]
+            last_saved = doctor_last_saved.get(d, "")
+            if last_saved and len(allowed) > 1:
+                allowed = [p for p in allowed if p != last_saved]
+            if not allowed:
+                allowed = alive[:]
+            if game_cfg.night_mode == "model":
+                raw = model_generate(
+                    llm,
+                    doctor_prompt(d, persona[d], day_round, alive, last_saved, public_transcript),
+                    sampling,
+                    sampling.max_tokens_vote,
+                )
+                saved = parse_vote(raw, alive, d, rng, allowed=allowed)
+            else:
+                saved = rng.choice(allowed)
+                raw = f"VOTE: {saved}"
+            doctor_last_saved[d] = saved
+            doctor_saved = saved
+            night_private_events.append(
+                {"phase": "doctor_save", "round": day_round, "actor": d, "target": saved, "raw": raw}
+            )
+            break
+
+        if night_kill_target and night_kill_target in alive:
+            if night_kill_target == doctor_saved:
+                public_transcript.append({"phase": "night_result", "round": day_round, "result": "no_death"})
+            else:
+                killed_role = roles[night_kill_target]
+                alive.remove(night_kill_target)
+                public_transcript.append(
+                    {
+                        "phase": "night_kill",
+                        "round": day_round,
+                        "target": night_kill_target,
+                        "revealed_role": killed_role,
+                    }
+                )
+
+        muted_today = {p for p in next_muted if p in alive}
+        if muted_today:
+            public_transcript.append(
+                {"phase": "day_mute_applied", "round": day_round + 1, "targets": sorted(muted_today)}
+            )
 
         winner = win_status(alive, roles)
         if winner:
+            win_reason = "Standard parity/elimination win condition after night."
             break
 
     if not winner:
         winner = "draw"
+        win_reason = "Reached max rounds without decisive win condition."
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -399,9 +638,11 @@ def run_single_game(
         "roles": roles,
         "persona": persona,
         "winner": winner,
-        "rounds_played": max((x["round"] for x in transcript if "round" in x), default=0),
+        "win_reason": win_reason,
+        "rounds_played": max((x["round"] for x in public_transcript if "round" in x), default=0),
         "alive_end": alive,
-        "transcript": transcript,
+        "public_transcript": public_transcript,
+        "private_night_events": night_private_events,
     }
 
 
@@ -444,13 +685,7 @@ def existing_game_ids(out_dir: Path) -> set:
     return seen
 
 
-def worker_run(
-    worker_id: int,
-    game_ids: List[int],
-    runtime: RuntimeConfig,
-    game_cfg: GameConfig,
-    sampling: SamplingConfig,
-) -> Dict:
+def worker_run(worker_id: int, game_ids: List[int], runtime: RuntimeConfig, game_cfg: GameConfig, sampling: SamplingConfig) -> Dict:
     worker_seed = runtime.base_seed + worker_id * 100_000
     llm = load_model(runtime, worker_seed)
     out_dir = Path(runtime.out_dir)
@@ -537,13 +772,22 @@ def build_merged_summary(out_dir: Path) -> Tuple[int, Counter, float]:
     return len(rows), counts, avg_rounds
 
 
-def main() -> None:
-    args = parse_args()
-    if args.mafia_count <= 0 or args.mafia_count >= args.players:
+def validate_role_counts(game_cfg: GameConfig) -> None:
+    if game_cfg.mafia_count <= 0 or game_cfg.mafia_count >= game_cfg.players:
         raise ValueError("--mafia_count must be > 0 and < --players")
-    if args.talks_per_day <= 0:
+    if game_cfg.silencer_count < 0 or game_cfg.silencer_count > game_cfg.mafia_count:
+        raise ValueError("--silencer_count must be between 0 and --mafia_count")
+    if game_cfg.doctor_count < 0 or game_cfg.detective_count < 0 or game_cfg.jester_count < 0:
+        raise ValueError("role counts cannot be negative")
+    special_non_mafia = game_cfg.doctor_count + game_cfg.detective_count + game_cfg.jester_count
+    if game_cfg.mafia_count + special_non_mafia > game_cfg.players:
+        raise ValueError("sum of mafia/special role counts exceeds --players")
+    if game_cfg.talks_per_day <= 0:
         raise ValueError("--talks_per_day must be >= 1")
 
+
+def main() -> None:
+    args = parse_args()
     parallel_games = choose_parallel_games(args.parallel_games)
     runtime = RuntimeConfig(
         model_path=args.model_path,
@@ -566,6 +810,10 @@ def main() -> None:
     game_cfg = GameConfig(
         players=args.players,
         mafia_count=args.mafia_count,
+        silencer_count=args.silencer_count,
+        doctor_count=args.doctor_count,
+        detective_count=args.detective_count,
+        jester_count=args.jester_count,
         max_rounds=args.max_rounds,
         talks_per_day=args.talks_per_day,
         allow_tie_break_random=not args.no_tie_break_random,
@@ -573,6 +821,7 @@ def main() -> None:
         night_mode=args.night_mode,
         persona_pool=personas,
     )
+    validate_role_counts(game_cfg)
     sampling = SamplingConfig(
         temperature=args.temperature,
         top_p=args.top_p,
@@ -603,7 +852,6 @@ def main() -> None:
         return
 
     batches = chunked(target_game_ids, runtime.parallel_games)
-    total_counts = Counter()
     start = time.time()
     with ProcessPoolExecutor(max_workers=runtime.parallel_games) as ex:
         futures = [
@@ -612,7 +860,6 @@ def main() -> None:
         ]
         for f in as_completed(futures):
             result = f.result()
-            total_counts.update(result["counts"])
             print(f"worker={result['worker_id']} done={result['games_done']} counts={result['counts']}", flush=True)
 
     elapsed = time.time() - start
